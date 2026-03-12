@@ -18,6 +18,67 @@ const db           = require('./services/db');
 const googleAuth   = require('./services/googleAuth');
 const webhookRoute = require('./routes/webhook');
 
+// ── Auto-create all tables on startup ──────────────────────────────────────
+async function initDatabase() {
+  try {
+    await db.pool.query(`
+      CREATE TABLE IF NOT EXISTS bookings (
+        id SERIAL PRIMARY KEY, name VARCHAR(100) NOT NULL,
+        phone VARCHAR(20), email VARCHAR(100), date DATE NOT NULL,
+        time VARCHAR(20) NOT NULL, guests INTEGER DEFAULT 2,
+        occasion VARCHAR(50) DEFAULT 'Regular Dining',
+        status VARCHAR(20) DEFAULT 'confirmed',
+        source VARCHAR(30) DEFAULT 'manual',
+        notes TEXT, created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS reviews (
+        id SERIAL PRIMARY KEY, gmb_review_id VARCHAR(200) UNIQUE,
+        reviewer_name VARCHAR(100), rating INTEGER NOT NULL,
+        comment TEXT, review_date TIMESTAMP, reply_text TEXT,
+        reply_date TIMESTAMP, reply_posted BOOLEAN DEFAULT FALSE,
+        ai_generated BOOLEAN DEFAULT FALSE, created_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS qa (
+        id SERIAL PRIMARY KEY, gmb_question_id VARCHAR(200) UNIQUE,
+        question TEXT NOT NULL, author VARCHAR(100), asked_at TIMESTAMP,
+        answer TEXT, answer_posted BOOLEAN DEFAULT FALSE,
+        ai_generated BOOLEAN DEFAULT FALSE, created_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS conversations (
+        id SERIAL PRIMARY KEY, session_id VARCHAR(100),
+        messages JSONB DEFAULT '[]', resolved BOOLEAN DEFAULT FALSE,
+        booking_made BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS webhook_events (
+        id SERIAL PRIMARY KEY, event_type VARCHAR(50),
+        payload JSONB, processed BOOLEAN DEFAULT FALSE,
+        error TEXT, received_at TIMESTAMP DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS restaurant_settings (
+        id SERIAL PRIMARY KEY, key VARCHAR(100) UNIQUE NOT NULL,
+        value TEXT, updated_at TIMESTAMP DEFAULT NOW()
+      );
+      INSERT INTO restaurant_settings (key, value) VALUES
+        ('name','Spice Garden Restaurant'),
+        ('address','SG Highway, Ahmedabad, Gujarat'),
+        ('phone','+91 98765 43210'),
+        ('hours','Mon-Sun: 11:00 AM - 11:00 PM'),
+        ('cuisine','North Indian, Chinese, Gujarati'),
+        ('reply_tone','warm'),
+        ('auto_reply','true'),
+        ('auto_qa','true'),
+        ('auto_booking','true')
+      ON CONFLICT (key) DO NOTHING;
+    `);
+    console.log('✅ Database tables ready');
+  } catch (err) {
+    console.error('❌ Database init error:', err.message);
+  }
+}
+
+
 const app       = express();
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -266,7 +327,7 @@ app.get('/api/pending', async (req, res) => {
 
 // Start server
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════╗
 ║   🍽  GMB AI Agent v2 — Running              ║
@@ -277,6 +338,7 @@ app.listen(PORT, () => {
 ║   ❤️  Health:  /health                        ║
 ╚══════════════════════════════════════════════╝
   `);
+  await initDatabase();
 });
 
 module.exports = app;
