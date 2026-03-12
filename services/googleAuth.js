@@ -1,286 +1,61 @@
 /**
- * GMB AI Agent — Backend Server v2
- * ✅ PostgreSQL database
- * ✅ Persistent Google OAuth tokens
- * ✅ GMB Webhook auto-triggers
- * ✅ Claude AI integration
+ * services/googleAuth.js
+ * Persistent OAuth2 client — tokens saved to DB
  */
-// WRONG (what's currently there):
-const db = require('./services/db');
 
-// CHANGE TO:
-const db = require('./db');
-const express    = require('express');
-const session    = require('express-session');
 const { google } = require('googleapis');
-const Anthropic  = require('@anthropic-ai/sdk');
-const cors       = require('cors');
-const path       = require('path');
-require('dotenv').config();
+const db         = require('./db');
 
-const db           = require('./services/db');
-const googleAuth   = require('./services/googleAuth');
-const webhookRoute = require('./routes/webhook');
+const oauth2Client = new google.auth.OAuth2(
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET,
+  process.env.GOOGLE_REDIRECT_URI
+);
 
-const app       = express();
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
-app.use(express.json());
-app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:3000', credentials: true }));
-app.use(express.static(path.join(__dirname, 'public')));
-app.use(session({
-  secret:            process.env.SESSION_SECRET || 'gmb-secret-change-me',
-  resave:            false,
-  saveUninitialized: false,
-  cookie:            { secure: process.env.NODE_ENV === 'production', maxAge: 7 * 24 * 60 * 60 * 1000 }
-}));
-
-// Webhook route (raw body needed for signature verification)
-app.use('/webhook', webhookRoute);
-
-// Health check (used by Docker + Railway)
-app.get('/health', async (req, res) => {
-  try {
-    await db.pool.query('SELECT 1');
-    res.json({ status: 'ok', db: 'connected', timestamp: new Date().toISOString() });
-  } catch {
-    res.status(500).json({ status: 'error', db: 'disconnected' });
-  }
+// Auto-refresh tokens and save to DB
+oauth2Client.on('tokens', async (tokens) => {
+  console.log('🔑 Tokens refreshed, saving to DB...');
+  if (tokens.access_token)  await db.setSetting('google_access_token',  tokens.access_token);
+  if (tokens.refresh_token) await db.setSetting('google_refresh_token', tokens.refresh_token);
+  if (tokens.expiry_date)   await db.setSetting('google_token_expiry',  String(tokens.expiry_date));
 });
 
-// OAuth Scopes
-const SCOPES = [
-  'https://www.googleapis.com/auth/business.manage',
-  'https://www.googleapis.com/auth/plus.business.manage'
-];
-
-// Auth Routes
-app.get('/auth/google', (req, res) => {
-  const url = googleAuth.generateAuthUrl({ access_type: 'offline', scope: SCOPES, prompt: 'consent' });
-  res.redirect(url);
-});
-
-app.get('/auth/callback', async (req, res) => {
+// Load saved tokens from DB on startup
+async function loadTokens() {
   try {
-    const { tokens } = await googleAuth.getToken(req.query.code);
-    await googleAuth.saveTokens(tokens);
-    req.session.authenticated = true;
-    res.redirect('/?auth=success');
+    const access_token  = await db.getSetting('google_access_token');
+    const refresh_token = await db.getSetting('google_refresh_token');
+    const expiry_date   = await db.getSetting('google_token_expiry');
+
+    if (access_token && refresh_token) {
+      oauth2Client.setCredentials({
+        access_token,
+        refresh_token,
+        expiry_date: expiry_date ? parseInt(expiry_date) : undefined
+      });
+      console.log('✅ Google OAuth tokens loaded from database');
+      return true;
+    }
+    console.log('⚠️  No saved Google tokens found. Visit /auth/google to connect.');
+    return false;
   } catch (err) {
-    console.error('Auth error:', err);
-    res.redirect('/?auth=error');
+    console.error('❌ Failed to load tokens:', err.message);
+    return false;
   }
-});
-
-app.get('/auth/status', (req, res) => {
-  res.json({ authenticated: !!req.session.authenticated });
-});
-
-app.post('/auth/logout', (req, res) => {
-  req.session.destroy();
-  res.json({ success: true });
-});
-
-// Auth middleware
-function requireAuth(req, res, next) {
-  if (!req.session.authenticated) {
-    return res.status(401).json({ error: 'Not authenticated. Visit /auth/google to connect.' });
-  }
-  next();
 }
 
-// Restaurant Settings
-app.get('/api/settings', async (req, res) => {
-  try {
-    res.json({ settings: await db.getAllSettings() });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
+// Save new tokens to DB (called after OAuth callback)
+async function saveTokens(tokens) {
+  oauth2Client.setCredentials(tokens);
+  if (tokens.access_token)  await db.setSetting('google_access_token',  tokens.access_token);
+  if (tokens.refresh_token) await db.setSetting('google_refresh_token', tokens.refresh_token);
+  if (tokens.expiry_date)   await db.setSetting('google_token_expiry',  String(tokens.expiry_date));
+  console.log('✅ Google tokens saved to database');
+}
 
-app.post('/api/settings', async (req, res) => {
-  try {
-    for (const [key, value] of Object.entries(req.body)) {
-      await db.setSetting(key, String(value));
-    }
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
+// Initialize on module load
+loadTokens();
 
-// GMB Locations
-app.get('/api/locations', requireAuth, async (req, res) => {
-  try {
-    const mybusiness  = google.mybusinessaccountmanagement({ version: 'v1', auth: googleAuth });
-    const accounts    = await mybusiness.accounts.list();
-    const accountList = accounts.data.accounts || [];
-    const locations   = [];
-    for (const account of accountList) {
-      const locApi = google.mybusinessbusinessinformation({ version: 'v1', auth: googleAuth });
-      const locs   = await locApi.accounts.locations.list({
-        parent: account.name,
-        readMask: 'name,title,phoneNumbers,storefrontAddress,websiteUri,regularHours'
-      });
-      if (locs.data.locations) locations.push(...locs.data.locations);
-    }
-    res.json({ locations });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// Reviews
-app.get('/api/reviews/:accountId/:locationId', requireAuth, async (req, res) => {
-  try {
-    const api      = google.mybusiness({ version: 'v4', auth: googleAuth });
-    const response = await api.accounts.locations.reviews.list({
-      parent: `accounts/${req.params.accountId}/locations/${req.params.locationId}`
-    });
-    res.json({ reviews: response.data.reviews || [] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post('/api/reviews/:accountId/:locationId/:reviewId/reply', requireAuth, async (req, res) => {
-  try {
-    const { accountId, locationId, reviewId } = req.params;
-    const api = google.mybusiness({ version: 'v4', auth: googleAuth });
-    await api.accounts.locations.reviews.updateReply({
-      name:        `accounts/${accountId}/locations/${locationId}/reviews/${reviewId}`,
-      requestBody: { comment: req.body.comment }
-    });
-    await db.markReplyPosted(reviewId);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// Q&A
-app.get('/api/qa/:locationId', requireAuth, async (req, res) => {
-  try {
-    const api      = google.mybusinessqanda({ version: 'v1', auth: googleAuth });
-    const response = await api.locations.questions.list({ parent: `locations/${req.params.locationId}` });
-    res.json({ questions: response.data.questions || [] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post('/api/qa/:locationId/:questionId/answer', requireAuth, async (req, res) => {
-  try {
-    const api = google.mybusinessqanda({ version: 'v1', auth: googleAuth });
-    await api.locations.questions.answers.upsert({
-      parent:      `locations/${req.params.locationId}/questions/${req.params.questionId}`,
-      requestBody: { answer: { text: req.body.text } }
-    });
-    await db.markAnswerPosted(req.params.questionId);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// AI Routes
-const AGENT_SYSTEM = `You are a professional AI support agent for a restaurant on Google My Business.
-Be friendly, concise (2-4 sentences), warm, and represent the restaurant professionally.`;
-
-app.post('/api/ai/review-reply', async (req, res) => {
-  try {
-    const { reviewText, rating, restaurantName } = req.body;
-    const sentiment = rating >= 4 ? 'grateful' : rating === 3 ? 'understanding' : 'sincerely apologetic';
-    const response  = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514', max_tokens: 300,
-      system: AGENT_SYSTEM,
-      messages: [{ role: 'user', content: `Write a ${sentiment} reply to this ${rating}/5 star review for ${restaurantName}:\n"${reviewText}"\nSign as "The ${restaurantName} Team".` }]
-    });
-    res.json({ reply: response.content[0].text });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post('/api/ai/answer-question', async (req, res) => {
-  try {
-    const { question, restaurantName, restaurantInfo } = req.body;
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514', max_tokens: 300,
-      system: AGENT_SYSTEM,
-      messages: [{ role: 'user', content: `Answer this GMB question about ${restaurantName}:\n"${question}"\n\nRestaurant info: ${restaurantInfo}` }]
-    });
-    res.json({ answer: response.content[0].text });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post('/api/ai/chat', async (req, res) => {
-  try {
-    const { message, conversationHistory = [], restaurantInfo, sessionId } = req.body;
-    const settings = await db.getAllSettings();
-    const info     = restaurantInfo || `${settings.name} | ${settings.address} | ${settings.hours}`;
-
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514', max_tokens: 500,
-      system:   `${AGENT_SYSTEM}\n\nRestaurant: ${info}`,
-      messages: [...conversationHistory, { role: 'user', content: message }]
-    });
-
-    const reply = response.content[0].text;
-
-    if (sessionId) {
-      await db.appendMessage(sessionId, 'user',      message);
-      await db.appendMessage(sessionId, 'assistant', reply);
-    }
-
-    res.json({
-      reply,
-      updatedHistory: [
-        ...conversationHistory,
-        { role: 'user',      content: message },
-        { role: 'assistant', content: reply }
-      ]
-    });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// Bookings (PostgreSQL)
-app.get('/api/bookings', async (req, res) => {
-  try {
-    res.json({ bookings: await db.getBookings(req.query.date) });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post('/api/bookings', async (req, res) => {
-  try {
-    const booking = await db.createBooking(req.body);
-    const msg     = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514', max_tokens: 100,
-      messages: [{ role: 'user', content: `Write a 1-sentence warm booking confirmation for ${booking.name}, table for ${booking.guests} on ${booking.date} at ${booking.time}.` }]
-    });
-    res.json({ booking, confirmationMessage: msg.content[0].text });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.patch('/api/bookings/:id', async (req, res) => {
-  try {
-    res.json({ booking: await db.updateBooking(req.params.id, req.body) });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.delete('/api/bookings/:id', async (req, res) => {
-  try {
-    await db.deleteBooking(req.params.id);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// Pending items from DB
-app.get('/api/pending', async (req, res) => {
-  try {
-    const reviews   = await db.getPendingReplies();
-    const questions = await db.getPendingQuestions();
-    res.json({ reviews, questions });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// Start server
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.log(`
-╔══════════════════════════════════════════════╗
-║   🍽  GMB AI Agent v2 — Running              ║
-║   http://localhost:${PORT}                      ║
-║                                              ║
-║   🔐 Auth:     /auth/google                  ║
-║   🔗 Webhook:  /webhook/gmb                  ║
-║   ❤️  Health:  /health                        ║
-╚══════════════════════════════════════════════╝
-  `);
-});
-
-module.exports = app;
+module.exports = oauth2Client;
+module.exports.loadTokens = loadTokens;
+module.exports.saveTokens = saveTokens;
