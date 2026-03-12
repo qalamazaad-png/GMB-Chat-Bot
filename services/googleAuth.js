@@ -5,7 +5,11 @@
  * ✅ GMB Webhook auto-triggers
  * ✅ Claude AI integration
  */
+// WRONG (what's currently there):
+const db = require('./services/db');
 
+// CHANGE TO:
+const db = require('./db');
 const express    = require('express');
 const session    = require('express-session');
 const { google } = require('googleapis');
